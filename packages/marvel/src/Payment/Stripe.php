@@ -88,6 +88,42 @@ class Stripe extends Base implements PaymentInterface
     return $detachedPaymentMethod;
   }
 
+    // Add this method to handle customer creation/retrieval
+    private function getOrCreateCustomer($customerData = null)
+    {
+        if (!$customerData || empty($customerData['email'])) {
+            return null; // No customer data provided
+        }
+
+        try {
+            // Try to find existing customer by email
+            $customers = $this->stripe->customers->all([
+                'email' => $customerData['email'],
+                'limit' => 1
+            ]);
+
+            if ($customers->data && count($customers->data) > 0) {
+                return $customers->data[0]->id;
+            }
+
+            // Create new customer
+            $customer = $this->stripe->customers->create([
+                'email' => $customerData['email'],
+                'name' => $customerData['name'] ?? null,
+                'phone' => $customerData['phone'] ?? null,
+            ]);
+
+            return $customer->id;
+        } catch (\Exception $e) {
+            \Log::error('Error creating/retrieving Stripe customer', [
+                'error' => $e->getMessage(),
+                'customer_data' => $customerData
+            ]);
+            return null;
+        }
+    }
+
+
   /**
    * getIntent
    *
@@ -98,52 +134,67 @@ class Stripe extends Base implements PaymentInterface
   {
 
     try {
-      extract($data);
+        extract($data);
 
-      // Get the success and cancel URLs from config or use defaults
-      $success_url = config('shop.stripe.success_url', url('/stripe/payment-success'));
-      $cancel_url = config('shop.stripe.cancel_url', url('/stripe/payment-cancel'));
+        $success_url = config('shop.stripe.success_url', url('/stripe/payment-success'));
+        $cancel_url = config('shop.stripe.cancel_url', url('/stripe/payment-cancel'));
 
-      // Create a Checkout Session for hosted checkout
-      $checkout_session = [
-        'payment_method_types' => ['card'],
-        'line_items' => [[
-          'price_data' => [
-            'currency' => $this->currency,
-            'product_data' => [
-              'name' => 'Order Payment',
-              'description' => 'Marvel Payment',
-            ],
-            'unit_amount' => round($amount, 2) * 100,
-          ],
-          'quantity' => 1,
-        ]],
-        'mode' => 'payment',
-        'success_url' => $success_url . '?session_id={CHECKOUT_SESSION_ID}',
-        'cancel_url' => $cancel_url,
-        'metadata' => [
-          'order_tracking_number' => $order_tracking_number,
-        ]
-      ];
+        $checkout_session = [
+            'payment_method_types' => ['card'],
+            'line_items' => [[
+                'price_data' => [
+                    'currency' => $this->currency,
+                    'product_data' => [
+                        'name' => 'Order Payment',
+                        'description' => 'Marvel Payment',
+                    ],
+                    'unit_amount' => round($amount, 2) * 100,
+                ],
+                'quantity' => 1,
+            ]],
+            'mode' => 'payment',
+            'success_url' => $success_url . '?session_id={CHECKOUT_SESSION_ID}',
+            'cancel_url' => $cancel_url,
+            'metadata' => [
+                'order_tracking_number' => $order_tracking_number,
+            ]
+        ];
 
-      if (isset($customer)) {
-        $checkout_session['customer'] = $customer;
-      }
+        // Handle customer - either use provided ID or create new customer
+        if (isset($customer) && !empty($customer)) {
+            // If customer is an ID string
+            if (is_string($customer) && strpos($customer, 'cus_') === 0) {
+                try {
+                    $this->stripe->customers->retrieve($customer);
+                    $checkout_session['customer'] = $customer;
+                } catch (\Stripe\Exception\InvalidRequestException $e) {
+                    \Log::warning('Invalid customer ID provided', ['customer_id' => $customer]);
+                    // Continue without customer or create new one
+                }
+            }
+            // If customer is an array with customer data
+            elseif (is_array($customer)) {
+                $customerId = $this->getOrCreateCustomer($customer);
+                if ($customerId) {
+                    $checkout_session['customer'] = $customerId;
+                }
+            }
+        }
 
-      $session = $this->stripe->checkout->sessions->create($checkout_session);
+        $session = $this->stripe->checkout->sessions->create($checkout_session);
 
-      return [
-        'client_secret' => $session->id,
-        'payment_id'    => $session->payment_intent,
-        'is_redirect'   => true,
-        'redirect_url'  => $session->url
-      ];
+        return [
+            'client_secret' => $session->id,
+            'payment_id'    => $session->payment_intent,
+            'is_redirect'   => true,
+            'redirect_url'  => $session->url
+        ];
     } catch (\Stripe\Exception\CardException $e) {
       throw new HttpException(400, INVALID_CARD);
     } catch (\Stripe\Exception\RateLimitException $e) {
       throw new HttpException(400, TOO_MANY_REQUEST);
     } catch (\Stripe\Exception\InvalidRequestException $e) {
-      throw new HttpException(400, INVALID_REQUEST);
+      throw new HttpException(400, $e->getMessage());
     } catch (\Stripe\Exception\InvalidArgumentException $e) {
       throw new HttpException(400, INVALID_REQUEST);
     } catch (\Stripe\Exception\AuthenticationException $e) {
